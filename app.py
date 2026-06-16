@@ -1,10 +1,18 @@
 """TTC Subway Delay Dashboard."""
+import datetime
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
-# ── Page config ──────────────────────────────────────────────────────────────
+try:
+    from google.transit import gtfs_realtime_pb2
+    _GTFS_RT_OK = True
+except ImportError:
+    _GTFS_RT_OK = False
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="TTC Subway Delays",
     page_icon="🚇",
@@ -20,7 +28,31 @@ LINE_LABELS = {
 }
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
+GTFS_RT_ALERTS_URL = "https://bustime.ttc.ca/gtfsrt/alerts"
 
+_ROUTE_TO_LINE = {"1": "YU", "2": "BD", "4": "SHP"}
+_SUBWAY_ROUTE_IDS = set(_ROUTE_TO_LINE.keys())
+_LINE_KEYWORDS = {
+    "YU": {"line 1", "yonge", "university", "yus"},
+    "BD": {"line 2", "bloor", "danforth"},
+    "SHP": {"line 4", "sheppard"},
+}
+_EFFECT_LABEL = {
+    1: ("No Service", "error"),
+    2: ("Reduced Service", "warning"),
+    3: ("Significant Delays", "warning"),
+    4: ("Detour", "warning"),
+    5: ("Additional Service", "success"),
+    6: ("Modified Service", "warning"),
+    7: ("Service Advisory", "info"),
+    8: ("Service Advisory", "info"),
+    9: ("Stop Moved", "info"),
+    10: ("On Time", "success"),
+    11: ("Accessibility Issue", "info"),
+}
+
+
+# ── Data loaders ──────────────────────────────────────────────────────────────
 @st.cache_data
 def load_data() -> pd.DataFrame:
     df = pd.read_csv("data/ttc_subway_delays.csv", parse_dates=["Date"])
@@ -29,6 +61,71 @@ def load_data() -> pd.DataFrame:
     df["YearMonth"] = df["Date"].dt.to_period("M")
     df["Day"] = pd.Categorical(df["Day"], categories=DAY_ORDER, ordered=True)
     return df
+
+
+@st.cache_data(ttl=60)
+def fetch_live_alerts(cache_key: int = 0):
+    """Fetch TTC GTFS-RT service alerts. Returns (alerts, fetched_at, error_msg)."""
+    if not _GTFS_RT_OK:
+        return [], datetime.datetime.now(), "gtfs-realtime-bindings not installed"
+    try:
+        resp = requests.get(
+            GTFS_RT_ALERTS_URL,
+            timeout=10,
+            headers={"User-Agent": "TTC-Dashboard/1.0"},
+        )
+        resp.raise_for_status()
+
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(resp.content)
+
+        alerts = []
+        for entity in feed.entity:
+            if not entity.HasField("alert"):
+                continue
+            alert = entity.alert
+
+            # Identify affected subway lines by route_id
+            lines = {
+                _ROUTE_TO_LINE[ie.route_id]
+                for ie in alert.informed_entity
+                if ie.route_id in _SUBWAY_ROUTE_IDS
+            }
+
+            header = (
+                alert.header_text.translation[0].text
+                if alert.header_text.translation else ""
+            )
+            desc = (
+                alert.description_text.translation[0].text
+                if alert.description_text.translation else ""
+            )
+
+            # Fall back to keyword matching in the header text
+            if not lines:
+                lower = header.lower()
+                for line_key, keywords in _LINE_KEYWORDS.items():
+                    if any(kw in lower for kw in keywords):
+                        lines.add(line_key)
+                if not lines and "subway" in lower:
+                    lines = {"YU", "BD", "SHP"}
+
+            if not lines:
+                continue
+
+            label, severity = _EFFECT_LABEL.get(alert.effect, ("Service Advisory", "info"))
+            alerts.append({
+                "lines": lines,
+                "header": header,
+                "description": desc,
+                "label": label,
+                "severity": severity,
+            })
+
+        return alerts, datetime.datetime.now(), None
+
+    except Exception as exc:
+        return [], datetime.datetime.now(), str(exc)
 
 
 df_all = load_data()
@@ -84,6 +181,64 @@ st.caption(
     f"Showing **{len(df):,}** delay events · "
     f"{start.strftime('%b %d, %Y')} – {end.strftime('%b %d, %Y')}"
 )
+
+# ── Live Status Section ───────────────────────────────────────────────────────
+if "refresh_count" not in st.session_state:
+    st.session_state.refresh_count = 0
+
+live_alerts, fetched_at, fetch_error = fetch_live_alerts(st.session_state.refresh_count)
+
+hdr_col, btn_col = st.columns([6, 1])
+with hdr_col:
+    st.subheader("Live Subway Status")
+    st.caption(f"Last updated: {fetched_at.strftime('%I:%M:%S %p')} · auto-refreshes every 60 s")
+with btn_col:
+    if st.button("↻ Refresh", use_container_width=True):
+        st.session_state.refresh_count += 1
+        st.rerun()
+
+if fetch_error:
+    st.warning(f"Could not reach TTC live feed: {fetch_error}")
+else:
+    # Build per-line alert index
+    line_alerts: dict[str, list] = {"YU": [], "BD": [], "SHP": []}
+    for a in live_alerts:
+        for line in a["lines"]:
+            if line in line_alerts:
+                line_alerts[line].append(a)
+
+    severity_order = {"error": 0, "warning": 1, "info": 2, "success": 3}
+
+    col_yu, col_bd, col_shp = st.columns(3)
+    for col, line_key in zip([col_yu, col_bd, col_shp], ["YU", "BD", "SHP"]):
+        with col:
+            alerts_for_line = line_alerts[line_key]
+            line_name = LINE_LABELS[line_key]
+            color = LINE_COLORS[line_key]
+            st.markdown(
+                f"<span style='color:{color};font-weight:700;font-size:1rem'>"
+                f"{line_name}</span>",
+                unsafe_allow_html=True,
+            )
+            if not alerts_for_line:
+                st.success("On Time")
+            else:
+                worst = min(alerts_for_line, key=lambda a: severity_order[a["severity"]])
+                display_fn = {
+                    "error": st.error,
+                    "warning": st.warning,
+                    "info": st.info,
+                    "success": st.success,
+                }[worst["severity"]]
+                display_fn(worst["label"])
+                for a in alerts_for_line:
+                    if a["header"]:
+                        st.markdown(f"**{a['header']}**")
+                    if a["description"]:
+                        with st.expander("Details"):
+                            st.write(a["description"])
+
+st.divider()
 
 if df.empty:
     st.warning("No data matches the current filters.")
@@ -303,7 +458,7 @@ fig_box.update_layout(
 )
 st.plotly_chart(fig_box, use_container_width=True)
 
-# ── Raw data table ─────────────────────────────────────────────────────────────
+# ── Raw data table ────────────────────────────────────────────────────────────
 with st.expander("Raw delay data"):
     st.dataframe(
         df[["Date", "Time", "Day", "Line", "Station", "Description", "Min Delay", "Min Gap", "Bound", "Vehicle"]]

@@ -134,6 +134,7 @@ df_all = load_data()
 with st.sidebar:
     st.title("🚇 TTC Delays")
     st.markdown("**Subway delay analytics · 2023–2024**")
+    st.caption("Source: City of Toronto Open Data")
     st.divider()
 
     min_date = df_all["Date"].min().date()

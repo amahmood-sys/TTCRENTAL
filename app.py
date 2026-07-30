@@ -1,5 +1,6 @@
 """TTC Subway Delay Dashboard — live status + historical analysis."""
 import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
 import requests
@@ -35,6 +36,7 @@ DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
 
 GTFS_RT_ALERTS_URL = "https://bustime.ttc.ca/gtfsrt/alerts"
 REFRESH_SECONDS = 30
+EASTERN = ZoneInfo("America/Toronto")  # Toronto time (auto EST/EDT)
 
 _ROUTE_TO_LINE = {"1": "YU", "2": "BD", "4": "SHP"}
 _SUBWAY_ROUTE_IDS = set(_ROUTE_TO_LINE.keys())
@@ -73,7 +75,7 @@ def load_data() -> pd.DataFrame:
 def fetch_live_alerts(cache_key: int = 0):
     """Fetch TTC GTFS-RT service alerts. Returns (alerts, fetched_at, error_msg)."""
     if not _GTFS_RT_OK:
-        return [], datetime.datetime.now(), "gtfs-realtime-bindings not installed"
+        return [], datetime.datetime.now(EASTERN), "gtfs-realtime-bindings not installed"
     try:
         resp = requests.get(
             GTFS_RT_ALERTS_URL, timeout=10,
@@ -120,9 +122,9 @@ def fetch_live_alerts(cache_key: int = 0):
                 "label": label, "severity": severity,
             })
 
-        return alerts, datetime.datetime.now(), None
+        return alerts, datetime.datetime.now(EASTERN), None
     except Exception as exc:
-        return [], datetime.datetime.now(), str(exc)
+        return [], datetime.datetime.now(EASTERN), str(exc)
 
 
 # ── Live view ─────────────────────────────────────────────────────────────────
@@ -139,7 +141,7 @@ def render_live():
     with hdr:
         st.subheader("🔴 Live Subway Status")
         auto = f"auto-refreshes every {REFRESH_SECONDS}s" if _AUTOREFRESH_OK else "manual refresh"
-        st.caption(f"Last updated {fetched_at.strftime('%I:%M:%S %p')} · {auto}")
+        st.caption(f"Last updated {fetched_at.strftime('%I:%M:%S %p %Z')} · {auto}")
     with btn:
         if st.button("↻ Refresh", use_container_width=True):
             st.session_state.refresh_count += 1

@@ -340,57 +340,13 @@ def render_history(df: pd.DataFrame, start, end):
         )
 
 
-# ── Authentication ────────────────────────────────────────────────────────────
-def _get_credentials():
-    """Read credentials from Streamlit secrets if configured, else built-in defaults.
-
-    To override securely (recommended), set these in .streamlit/secrets.toml or in
-    the Streamlit Cloud "Secrets" panel:
-        [auth]
-        username = "aayan"
-        password = "your-strong-password"
-    """
-    try:
-        auth = st.secrets["auth"]
-        return str(auth["username"]), str(auth["password"])
-    except Exception:
-        return "aayan", "123456"
-
-
-def require_login() -> bool:
-    """Gate the app behind a username + password. Returns True once authenticated."""
-    if st.session_state.get("authenticated"):
-        return True
-
-    valid_user, valid_pass = _get_credentials()
-    st.title("🚇 TTC Subway Delay Tracker")
-    st.markdown("#### 🔒 Please sign in to continue")
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in")
-    if submitted:
-        if username == valid_user and password == valid_pass:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Incorrect username or password.")
-    return False
-
-
 # ── App ───────────────────────────────────────────────────────────────────────
-if not require_login():
-    st.stop()
-
 df_all = load_data()
 
 with st.sidebar:
     st.title("🚇 TTC Delays")
     st.markdown("**Live status + delay analytics**")
     st.caption("Source: City of Toronto Open Data · TTC GTFS-RT")
-    if st.button("Log out", use_container_width=True):
-        st.session_state.authenticated = False
-        st.rerun()
     st.divider()
     st.markdown("**History filters**")
     st.caption("These apply to the History tab.")

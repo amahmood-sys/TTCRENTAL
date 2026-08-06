@@ -1,5 +1,8 @@
 """TTC Subway Delay Dashboard — live status + historical analysis."""
 import datetime
+import os
+import re
+import time
 from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.express as px
@@ -34,9 +37,35 @@ LINE_LABELS = {
 }
 DAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-GTFS_RT_ALERTS_URL = "https://bustime.ttc.ca/gtfsrt/alerts"
+# Feed URL is config, not a secret — overridable via env var without code changes.
+GTFS_RT_ALERTS_URL = os.environ.get(
+    "TTC_ALERTS_URL", "https://bustime.ttc.ca/gtfsrt/alerts"
+)
 REFRESH_SECONDS = 30
 EASTERN = ZoneInfo("America/Toronto")  # Toronto time (auto EST/EDT)
+
+# ── Hardening limits for the untrusted external feed ──────────────────────────
+MAX_FEED_BYTES = 5 * 1024 * 1024   # reject feed responses larger than 5 MB
+MAX_ALERTS = 500                   # cap alerts processed from one response
+MAX_TEXT_LEN = 500                 # truncate any single feed text field
+MANUAL_REFRESH_COOLDOWN = 5        # min seconds between manual refresh clicks
+
+
+def _clean_feed_text(text: str) -> str:
+    """Sanitize untrusted text from the live feed before it is rendered.
+
+    Strips control characters, neutralizes Markdown/HTML-significant characters
+    (Streamlit already escapes raw HTML, but Markdown emphasis could still be
+    injected), collapses whitespace, and truncates to a bounded length.
+    """
+    if not isinstance(text, str):
+        return ""
+    text = "".join(ch for ch in text if ch == "\n" or ch >= " ")  # drop control chars
+    text = re.sub(r"[*_`#\[\]<>]", "", text)                       # neutralize markdown/html
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > MAX_TEXT_LEN:
+        text = text[:MAX_TEXT_LEN].rstrip() + "…"
+    return text
 
 _ROUTE_TO_LINE = {"1": "YU", "2": "BD", "4": "SHP"}
 _SUBWAY_ROUTE_IDS = set(_ROUTE_TO_LINE.keys())
@@ -65,7 +94,14 @@ _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2, "success": 3}
 @st.cache_data
 def load_data() -> pd.DataFrame:
     df = pd.read_csv("data/ttc_subway_delays.csv", parse_dates=["Date"])
-    df["Hour"] = df["Time"].str[:2].astype(int)
+    required = {"Date", "Time", "Day", "Station", "Line", "Min Delay"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Dataset is missing required columns: {sorted(missing)}")
+    # Coerce Hour defensively — malformed Time values become NaN and are dropped.
+    df["Hour"] = pd.to_numeric(df["Time"].astype(str).str[:2], errors="coerce")
+    df = df.dropna(subset=["Hour"])
+    df["Hour"] = df["Hour"].astype(int)
     df["Month"] = df["Date"].dt.to_period("M").astype(str)
     df["Day"] = pd.Categorical(df["Day"], categories=DAY_ORDER, ordered=True)
     return df
@@ -80,14 +116,28 @@ def fetch_live_alerts(cache_key: int = 0):
         resp = requests.get(
             GTFS_RT_ALERTS_URL, timeout=10,
             headers={"User-Agent": "TTC-Dashboard/1.0"},
+            stream=True,
         )
         resp.raise_for_status()
 
+        # Fast reject via Content-Length, then hard-cap the streamed body so a
+        # malicious or malformed response can't exhaust memory.
+        declared = resp.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > MAX_FEED_BYTES:
+            return [], datetime.datetime.now(EASTERN), "Live feed response too large"
+        content = bytearray()
+        for chunk in resp.iter_content(chunk_size=16384):
+            content.extend(chunk)
+            if len(content) > MAX_FEED_BYTES:
+                return [], datetime.datetime.now(EASTERN), "Live feed response too large"
+
         feed = gtfs_realtime_pb2.FeedMessage()
-        feed.ParseFromString(resp.content)
+        feed.ParseFromString(bytes(content))
 
         alerts = []
         for entity in feed.entity:
+            if len(alerts) >= MAX_ALERTS:  # bound work regardless of feed size
+                break
             if not entity.HasField("alert"):
                 continue
             alert = entity.alert
@@ -97,11 +147,11 @@ def fetch_live_alerts(cache_key: int = 0):
                 for ie in alert.informed_entity
                 if ie.route_id in _SUBWAY_ROUTE_IDS
             }
-            header = (
+            header = _clean_feed_text(
                 alert.header_text.translation[0].text
                 if alert.header_text.translation else ""
             )
-            desc = (
+            desc = _clean_feed_text(
                 alert.description_text.translation[0].text
                 if alert.description_text.translation else ""
             )
@@ -144,8 +194,15 @@ def render_live():
         st.caption(f"Last updated {fetched_at.strftime('%I:%M:%S %p %Z')} · {auto}")
     with btn:
         if st.button("↻ Refresh", use_container_width=True):
-            st.session_state.refresh_count += 1
-            st.rerun()
+            # Throttle manual refreshes so the button can't hammer the TTC feed.
+            now_mono = time.monotonic()
+            last = st.session_state.get("last_manual_refresh", 0.0)
+            if now_mono - last < MANUAL_REFRESH_COOLDOWN:
+                st.toast(f"Please wait {MANUAL_REFRESH_COOLDOWN}s between refreshes.")
+            else:
+                st.session_state.last_manual_refresh = now_mono
+                st.session_state.refresh_count += 1
+                st.rerun()
 
     if err:
         st.warning(f"Could not reach the TTC live feed: {err}")
